@@ -329,7 +329,9 @@ class BloomAttention(nn.Module):
             # concatenate along seq_length dimension:
             #  - key: [batch_size * self.num_heads, head_dim, kv_length]
             #  - value: [batch_size * self.num_heads, kv_length, head_dim]
+            past_key = past_key.view(-1, *past_key.shape[-2:])
             key_layer = torch.cat((past_key, key_layer), dim=2)
+            past_value = past_value.view(-1, *past_value.shape[-2:])
             value_layer = torch.cat((past_value, value_layer), dim=1)
 
         _, _, kv_length = key_layer.shape
@@ -401,7 +403,8 @@ class BloomAttention(nn.Module):
                 use_cache
             )
         else:
-            raise ValueError("Block this path while we figure out how to run C++ code")
+            if torch.cuda.is_available():
+                raise ValueError("You must build the cuda kernel with: `python setup.py build_ext --inplace`")
             context_layer, present, attention_probs = self.compute_attention(
                 fused_qkv=fused_qkv,
                 layer_past=layer_past,
@@ -814,7 +817,7 @@ class BloomModel(BloomPreTrainedModel):
         seq_length_with_past = seq_length
         past_key_values_length = 0
         if past_key_values[0] is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
+            past_key_values_length = past_key_values[0][0].shape[-1]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
