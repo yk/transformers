@@ -388,6 +388,11 @@ class BloomAttention(nn.Module):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
         batch_size, q_length, _ = fused_qkv.shape
 
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            layer_past = (past_key.view(-1, *past_key.shape[-2:]), past_value.view(-1, *past_value.shape[-2:]))
+
+
         if CUSTOM_KERNELS_ENABLED:
             assert self.training is False, "Only foward pass was implemented"
             assert attention_mask.shape[-1] < 4096, "Custom kernel support only up to 4096 tokens"
