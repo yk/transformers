@@ -78,7 +78,7 @@ from setuptools import find_packages, setup
 
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-BUILD_EXTENSIONS = os.environ.get("BUILD_EXTENSIONS", False) | torch.cuda.is_available()
+BUILD_EXTENSIONS = (os.environ.get("BUILD_EXTENSIONS", "False") == "True") | torch.cuda.is_available()
 
 # Remove stale transformers.egg-info directory to avoid https://github.com/pypa/pip/issues/5466
 
@@ -247,6 +247,7 @@ class DepsTableUpdateCommand(Command):
         print(f"updating {target}")
         with open(target, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(content))
+
 
 extras = {}
 
