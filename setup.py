@@ -73,6 +73,7 @@ import shutil
 from distutils.core import Command
 from pathlib import Path
 
+import torch.cuda
 from setuptools import find_packages, setup
 
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -244,7 +245,6 @@ class DepsTableUpdateCommand(Command):
         print(f"updating {target}")
         with open(target, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(content))
-
 
 extras = {}
 
@@ -423,7 +423,7 @@ def get_extensions():
     extensions = []
 
     # TODO @thomasw21 build cuda kernels only on some conditions
-    if True:
+    if torch.cuda.is_available():
         extensions += [
             CUDAExtension(
                 name="transformers.models.bloom.custom_kernels.fused_bloom_attention_cuda",
@@ -444,6 +444,12 @@ def get_extensions():
         ]
     return extensions
 
+
+cmdclass = {
+    "deps_table_update": DepsTableUpdateCommand,
+}
+if torch.cuda.is_available():
+    cmdclass["build_ext"] = BuildExtension
 
 setup(
     name="transformers",
@@ -478,8 +484,5 @@ setup(
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
     ext_modules=get_extensions(),
-    cmdclass={
-        "deps_table_update": DepsTableUpdateCommand,
-        "build_ext": BuildExtension
-    },
+    cmdclass=cmdclass,
 )
