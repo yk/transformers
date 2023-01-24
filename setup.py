@@ -73,6 +73,7 @@ import shutil
 from distutils.core import Command
 from pathlib import Path
 
+import torch.cuda
 from setuptools import find_packages, setup
 
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -244,7 +245,6 @@ class DepsTableUpdateCommand(Command):
         with open(target, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(content))
 
-
 extras = {}
 
 extras["ja"] = deps_list("fugashi", "ipadic", "unidic_lite", "unidic", "sudachipy", "sudachidict_core", "rhoknp")
@@ -324,18 +324,18 @@ extras["deepspeed-testing"] = extras["deepspeed"] + extras["testing"] + extras["
 extras["quality"] = deps_list("black", "datasets", "isort", "flake8", "GitPython", "hf-doc-builder")
 
 extras["all"] = (
-        extras["tf"]
-        + extras["torch"]
-        + extras["flax"]
-        + extras["sentencepiece"]
-        + extras["tokenizers"]
-        + extras["torch-speech"]
-        + extras["vision"]
-        + extras["integrations"]
-        + extras["timm"]
-        + extras["codecarbon"]
-        + extras["accelerate"]
-        + extras["video"]
+    extras["tf"]
+    + extras["torch"]
+    + extras["flax"]
+    + extras["sentencepiece"]
+    + extras["tokenizers"]
+    + extras["torch-speech"]
+    + extras["vision"]
+    + extras["integrations"]
+    + extras["timm"]
+    + extras["codecarbon"]
+    + extras["accelerate"]
+    + extras["video"]
 )
 
 # Might need to add doc-builder and some specific deps in the future
@@ -419,7 +419,7 @@ def get_extensions():
     extensions = []
 
     # TODO @thomasw21 build cuda kernels only on some conditions
-    if True:
+    if torch.cuda.is_available():
         extensions += [
             CUDAExtension(
                 name="transformers.models.bloom.custom_kernels.fused_bloom_attention_cuda",
@@ -440,6 +440,12 @@ def get_extensions():
         ]
     return extensions
 
+
+cmdclass = {
+    "deps_table_update": DepsTableUpdateCommand,
+}
+if torch.cuda.is_available():
+    cmdclass["build_ext"] = BuildExtension
 
 setup(
     name="transformers",
@@ -474,8 +480,5 @@ setup(
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
     ext_modules=get_extensions(),
-    cmdclass={
-        "deps_table_update": DepsTableUpdateCommand,
-        "build_ext": BuildExtension
-    },
+    cmdclass=cmdclass,
 )
