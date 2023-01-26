@@ -154,72 +154,6 @@ def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: 
     out = residual + out
     return out
 
-@torch.jit.script
-def bloom_gelu_forward(x: torch.Tensor) -> torch.Tensor:
-    """
-    Custom bias GELU function. Adapted from Megatron-DeepSpeed code. Here we use a simple implementation (inference) to
-    make the model jitable.
-
-    Args:
-        x (`torch.tensor`, *required*):
-            input hidden states
-    """
-    return x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
-
-
-def bloom_gelu_back(g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """
-    gradient of tanh approximation of gelu gradient of actual gelu is: 0.5 * (1. + torch.erf(x * 0.70710678)) +
-    0.3989423 * x * torch.exp(-0.5 * x * x)
-
-    Args:
-        g (`torch.tensor`, *required*):
-            gradient output tensor
-        x (`torch.tensor`, *required*):
-            input tensor
-    """
-    x = x[0]  # x is a tuple of 1 element, needs to unpack it first
-    tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
-    # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
-    ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (1 + tanh_out)
-    return ff * g
-
-
-class GeLUFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input: torch.Tensor) -> torch.Tensor:
-        if False and CUSTOM_KERNELS_ENABLED:
-            """My kernel is actually still slow compared to what `jit` provides."""
-            raise ValueError("WTF")
-            fused_bloom_gelu_cuda.foward(input)
-        else:
-            ctx.save_for_backward(input)
-            return bloom_gelu_forward(input)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
-        input = ctx.saved_tensors
-        tmp = bloom_gelu_back(grad_output, input)
-        return tmp
-
-
-class BloomGelu(nn.Module):
-    """
-    BloomBiasGelu wrapper function that make use of the simple function on inference mode to make the model
-    torchscriptable and use the autograd function in training mode to get the accurate results of the gradients Partly
-    copied from Megatron-DeepSpeed code and adapted for our needs
-
-    See here why autograd functions are not torchscriptable: https://github.com/pytorch/pytorch/issues/22329
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training:
-            return GeLUFunction.apply(x)
-        else:
-            return bloom_gelu_forward(x)
 
 # @torch.jit.script # this is shit for unknow reasons.
 def _split_heads(fused_qkv: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -457,7 +391,7 @@ class BloomMLP(nn.Module):
         else:
             self.dense_h_to_4h = TensorParallelColumnLinear(hidden_size, 4 * hidden_size, process_group=process_group)
             self.dense_4h_to_h = TensorParallelRowLinear(4 * hidden_size, hidden_size, process_group=process_group)
-        self.gelu_impl = BloomGelu()
+        self.gelu_impl = torch.nn.GELU(approximate="tanh")
         self.hidden_dropout = config.hidden_dropout
 
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
