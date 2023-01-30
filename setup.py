@@ -73,12 +73,11 @@ import shutil
 from distutils.core import Command
 from pathlib import Path
 
-import torch.cuda
 from setuptools import find_packages, setup
 
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-BUILD_EXTENSIONS = (os.environ.get("BUILD_EXTENSIONS", "False") == "True") | torch.cuda.is_available()
+BUILD_EXTENSIONS = os.environ.get("BUILD_EXTENSIONS", "False") == "True"
 
 # Remove stale transformers.egg-info directory to avoid https://github.com/pypa/pip/issues/5466
 

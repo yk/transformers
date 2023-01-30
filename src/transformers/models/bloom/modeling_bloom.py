@@ -337,8 +337,6 @@ class BloomAttention(nn.Module):
                 use_cache
             )
         else:
-            if torch.cuda.is_available():
-                raise ValueError("You must build the cuda kernel with: `python setup.py build_ext --inplace`")
             context_layer, present, attention_probs = self.compute_attention(
                 fused_qkv=fused_qkv,
                 layer_past=layer_past,
