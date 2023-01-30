@@ -103,7 +103,8 @@ class GPTNeoXConfig(PretrainedConfig):
         eos_token_id=2,
         tie_word_embeddings=False,
         use_parallel_residual=True,
-        **kwargs,
+        tp_parallel=False,
+        **kwargs
     ):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
         self.vocab_size = vocab_size
@@ -120,3 +121,4 @@ class GPTNeoXConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.tie_word_embeddings = tie_word_embeddings
         self.use_parallel_residual = use_parallel_residual
+        self.tp_parallel = tp_parallel

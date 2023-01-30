@@ -69,15 +69,10 @@ def _make_causal_mask(
     Make causal mask used for self-attention.
     """
     batch_size, target_length = input_ids_shape
-    mask = torch.empty((target_length, target_length + past_key_values_length), dtype=torch.bool, device=device)
-    # ONNX doesn't support `torch.Tensor.triu` properly, thus we use this workaround
-    seq_ids = torch.arange(target_length, device=device)
-    mask[:, past_key_values_length:] = seq_ids[:, None] < seq_ids[None, :]
+    mask = torch.ones((target_length, target_length + past_key_values_length), dtype=torch.bool, device=device)
+    mask = mask.triu(1 + past_key_values_length)
 
-    if past_key_values_length > 0:
-        mask[:, :past_key_values_length] = False
-
-    expanded_mask = mask[None, :, :].expand(batch_size, target_length, target_length + past_key_values_length)
+    expanded_mask = mask.unsqueeze(0).expand(batch_size, target_length, target_length + past_key_values_length)
     return expanded_mask
 
 
