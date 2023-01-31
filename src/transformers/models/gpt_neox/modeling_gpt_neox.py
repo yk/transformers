@@ -16,7 +16,6 @@
 
 from typing import Optional, Tuple, Union
 
-import math
 import torch
 import torch.distributed
 import torch.utils.checkpoint
@@ -144,7 +143,8 @@ class GPTNeoXAttention(nn.Module):
         self.rotary_emb = RotaryEmbedding(
             self.rotary_ndims, config.max_position_embeddings, base=config.rotary_emb_base
         )
-        self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
+        self.inv_norm_factor = 1.0 / torch.sqrt(torch.tensor(self.head_size, dtype=torch.float32)).to(
+            torch.get_default_dtype())
 
         if process_group is None:
             self.query_key_value = nn.Linear(config.hidden_size, 3 * config.hidden_size)
