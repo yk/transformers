@@ -1,5 +1,8 @@
 import torch
 import torch.distributed
+
+import torch.nn.functional as F
+
 from torch import nn
 
 
@@ -24,6 +27,13 @@ class TensorParallelColumnLinear(nn.Linear):
                          device=device,
                          dtype=dtype)
 
+    @staticmethod
+    def linear(input, weight, bias):
+        return F.linear(input, weight, bias)
+
+    def forward(self, input):
+        return self.linear(input, self.weight, self.bias)
+
 
 class TensorParallelRowLinear(nn.Linear):
     def __init__(
@@ -46,8 +56,12 @@ class TensorParallelRowLinear(nn.Linear):
                          device=device,
                          dtype=dtype)
 
+    @staticmethod
+    def linear(input, weight, bias):
+        return F.linear(input, weight, bias)
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        out = super().forward(input)
+        out = self.linear(input, self.weight, self.bias)
         torch.distributed.all_reduce(out, group=self.process_group)
 
         return out
