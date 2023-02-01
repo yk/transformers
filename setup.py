@@ -436,8 +436,8 @@ def get_extensions():
                 extra_compile_args=["-arch=compute_80", "-std=c++17"],
             ),
             CUDAExtension(
-                name="transformers.models.bloom.custom_kernels.fused_bloom_gelu_cuda",
-                sources=["src/transformers/models/bloom/custom_kernels/fused_bloom_gelu_cuda.cu"],
+                name="transformers.models.gpt_neox.custom_kernels.fused_attention_cuda",
+                sources=["src/transformers/models/gpt_neox/custom_kernels/fused_attention_cuda.cu"],
                 # TODO: understand what that is, probably defines the target architecture
                 #  https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#options-for-steering-gpu-code-generation-gpu-architecture
                 # Build for A100

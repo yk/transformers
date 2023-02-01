@@ -43,7 +43,6 @@ logger = logging.get_logger(__name__)
 CUSTOM_KERNELS_ENABLED=False
 try:
     from .custom_kernels import fused_bloom_attention_cuda
-    from .custom_kernels import fused_bloom_gelu_cuda
     CUSTOM_KERNELS_ENABLED=True
 except ImportError:
     logger.warning("We're not using custom kernels.")

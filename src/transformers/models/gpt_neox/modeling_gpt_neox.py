@@ -37,6 +37,13 @@ from .parallel_layers import TensorParallelColumnLinear, TensorParallelEmbedding
 
 logger = logging.get_logger(__name__)
 
+CUSTOM_KERNELS_ENABLED=False
+try:
+    from .custom_kernels import fused_attention_cuda
+    CUSTOM_KERNELS_ENABLED=True
+except ImportError:
+    logger.warning("We're not using custom kernels.")
+
 _CHECKPOINT_FOR_DOC = "trl-internal-testing/tiny-random-GPTNeoXForCausalLM"
 _REAL_CHECKPOINT_FOR_DOC = "EleutherAI/gpt-neox-20b"
 _CONFIG_FOR_DOC = "GPTNeoXConfig"
@@ -152,7 +159,8 @@ class GPTNeoXAttention(nn.Module):
         else:
             assert self.num_attention_heads % process_group.size() == 0
             self.num_attention_heads = self.num_attention_heads // process_group.size()
-            self.query_key_value = TensorParallelColumnLinear(self.hidden_size, 3 * self.hidden_size, process_group=process_group, bias=True)
+            self.query_key_value = TensorParallelColumnLinear(self.hidden_size, 3 * self.hidden_size,
+                                                              process_group=process_group, bias=True)
             self.dense = TensorParallelRowLinear(self.hidden_size, self.hidden_size, process_group=process_group)
 
     def forward(
@@ -195,22 +203,39 @@ class GPTNeoXAttention(nn.Module):
             seq_len += offset
         cos, sin = self.rotary_emb(value, seq_len=seq_len)
         query, key = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, offset=offset)
-        query = torch.cat((query, query_pass), dim=-1)
-        key = torch.cat((key, key_pass), dim=-1)
 
-        # Cache QKV values
-        if has_layer_past:
-            past_key = layer_past[0]
-            past_value = layer_past[1]
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
-        present = (key, value) if use_cache else None
+        if CUSTOM_KERNELS_ENABLED:
+            attn_output, present, attn_weights = fused_attention_cuda.forward(
+                query,
+                query_pass,
+                key,
+                key_pass,
+                value,
+                layer_past,
+                attention_mask,
+                head_mask,
+                self.inv_norm_factor,
+                self.num_attention_heads,
+                use_cache
+            )
+        else:
+            query = torch.cat((query, query_pass), dim=-1)
+            key = torch.cat((key, key_pass), dim=-1)
 
-        # Compute attention
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+            # Cache QKV values
+            if has_layer_past:
+                past_key = layer_past[0]
+                past_value = layer_past[1]
+                key = torch.cat((past_key, key), dim=-2)
+                value = torch.cat((past_value, value), dim=-2)
+            present = (key, value) if use_cache else None
 
-        # Reshape outputs
-        attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_size)
+            # Compute attention
+            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+
+            # Reshape outputs
+            attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_size)
+
         attn_output = self.dense(attn_output)
 
         outputs = (attn_output, present)
@@ -294,25 +319,26 @@ class RotaryEmbedding(torch.nn.Module):
 
         # Build here to make `torch.jit.trace` work.
         self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        self.cos_cached = None
+        self.sin_cached = None
+
+    @staticmethod
+    def _create_cos_sin(inv_freq, max_position_embeddings, dtype, device):
+        t = torch.arange(max_position_embeddings, device=inv_freq.device, dtype=inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cached = emb.cos()[None, None, :, :]
-        self.sin_cached = emb.sin()[None, None, :, :]
+        return emb.cos()[None, None, :, :].to(device).to(dtype), emb.sin()[None, None, :, :].to(device).to(dtype)
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        # This `if` block is unlikely to be run after we build sin/cos in `__init__`. Keep the logic here just in case.
-        if seq_len > self.max_seq_len_cached:
-            self.max_seq_len_cached = seq_len
-            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            # Different from paper, but it uses a different permutation in order to obtain the same calculation
-            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.cos_cached = emb.cos()[None, None, :, :]
-            self.sin_cached = emb.sin()[None, None, :, :]
-        return self.cos_cached[:seq_len, ...].to(x.device), self.sin_cached[:seq_len, ...].to(x.device)
+        if seq_len > self.max_seq_len_cached or self.cos_cached is None or self.sin_cached is None:
+            if seq_len > self.max_seq_len_cached:
+                self.max_seq_len_cached = seq_len
+            self.cos_cached, self.sin_cached = self._create_cos_sin(self.inv_freq, self.max_seq_len_cached, x.dtype,
+                                                                    x.device)
+
+        return self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...]
 
 
 def rotate_half(x):
@@ -340,9 +366,10 @@ class GPTNeoXMLP(nn.Module):
             self.dense_h_to_4h = nn.Linear(config.hidden_size, config.intermediate_size)
             self.dense_4h_to_h = nn.Linear(config.intermediate_size, config.hidden_size)
         else:
-            self.dense_h_to_4h = TensorParallelColumnLinear(config.hidden_size, config.intermediate_size, process_group=process_group)
-            self.dense_4h_to_h = TensorParallelRowLinear(config.intermediate_size, config.hidden_size, process_group=process_group)
-
+            self.dense_h_to_4h = TensorParallelColumnLinear(config.hidden_size, config.intermediate_size,
+                                                            process_group=process_group)
+            self.dense_4h_to_h = TensorParallelRowLinear(config.intermediate_size, config.hidden_size,
+                                                         process_group=process_group)
 
     def forward(self, hidden_states):
         hidden_states = self.dense_h_to_4h(hidden_states)
@@ -467,18 +494,24 @@ GPT_NEOX_INPUTS_DOCSTRING = r"""
     GPT_NEOX_START_DOCSTRING,
 )
 class GPTNeoXModel(GPTNeoXPreTrainedModel):
-    def __init__(self, config, process_group: Optional[torch.distributed.ProcessGroup]=None):
+    def __init__(self, config, process_group: Optional[torch.distributed.ProcessGroup] = None):
         super().__init__(config)
         self.config = config
 
         self.num_attention_heads = config.num_attention_heads
 
-        if process_group is None:
-            self.embed_in = nn.Embedding(config.vocab_size, config.hidden_size)
-        else:
-            self.embed_in = TensorParallelEmbedding(config.vocab_size, config.hidden_size, process_group=process_group)
+        self.tp_embeddings = False
+        if process_group is not None:
             self.tp_rank = process_group.rank()
             self.tp_world_size = process_group.size()
+            if config.vocab_size % self.tp_world_size == 0:
+                self.tp_embeddings = True
+
+        if self.tp_embeddings:
+            self.embed_in = TensorParallelEmbedding(config.vocab_size, config.hidden_size,
+                                                    process_group=process_group)
+        else:
+            self.embed_in = nn.Embedding(config.vocab_size, config.hidden_size)
 
         self.layers = nn.ModuleList([GPTNeoXLayer(config, process_group) for _ in range(config.num_hidden_layers)])
         self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -654,10 +687,10 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
 
         self.gpt_neox = GPTNeoXModel(config, process_group)
 
-        if process_group is None:
-            self.embed_out = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        else:
+        if self.gpt_neox.tp_embeddings:
             self.embed_out = nn.Linear(config.hidden_size, config.vocab_size // process_group.size(), bias=False)
+        else:
+            self.embed_out = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
