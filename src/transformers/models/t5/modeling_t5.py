@@ -14,7 +14,6 @@
 # limitations under the License.
 """ PyTorch T5 model."""
 
-
 import copy
 import math
 import os
@@ -22,6 +21,7 @@ import warnings
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.distributed
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.utils.checkpoint import checkpoint
@@ -46,7 +46,7 @@ from ...utils import (
 )
 from ...utils.model_parallel_utils import assert_device_map, get_device_map
 from .configuration_t5 import T5Config
-
+from .parallel_layers import TensorParallelColumnLinear, TensorParallelEmbedding, TensorParallelRowLinear
 
 logger = logging.get_logger(__name__)
 
@@ -277,12 +277,20 @@ ALL_LAYERNORM_LAYERS.append(T5LayerNorm)
 
 
 class T5DenseActDense(nn.Module):
-    def __init__(self, config: T5Config):
+    def __init__(self, config: T5Config, process_group=None):
         super().__init__()
-        self.wi = nn.Linear(config.d_model, config.d_ff, bias=False)
-        self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
+        if process_group is None:
+            self.wi = nn.Linear(config.d_model, config.d_ff, bias=False)
+            self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
+        else:
+            self.wi = TensorParallelColumnLinear(config.d_model, config.d_ff, bias=False,
+                                                 process_group=process_group)
+            self.wo = TensorParallelRowLinear(config.d_ff, config.d_model, bias=False,
+                                              process_group=process_group)
+
         self.dropout = nn.Dropout(config.dropout_rate)
-        self.act = ACT2FN[config.dense_act_fn]
+        self.act = ACT2FN[config.dense_act_fn] if "gelu" not in config.dense_act_fn else lambda \
+                x: torch.nn.functional.gelu(x, approximate="tanh")
 
     def forward(self, hidden_states):
         hidden_states = self.wi(hidden_states)
@@ -295,13 +303,23 @@ class T5DenseActDense(nn.Module):
 
 
 class T5DenseGatedActDense(nn.Module):
-    def __init__(self, config: T5Config):
+    def __init__(self, config: T5Config, process_group=None):
         super().__init__()
-        self.wi_0 = nn.Linear(config.d_model, config.d_ff, bias=False)
-        self.wi_1 = nn.Linear(config.d_model, config.d_ff, bias=False)
-        self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
+        if process_group is None:
+            self.wi_0 = nn.Linear(config.d_model, config.d_ff, bias=False)
+            self.wi_1 = nn.Linear(config.d_model, config.d_ff, bias=False)
+            self.wo = nn.Linear(config.d_ff, config.d_model, bias=False)
+        else:
+            self.wi_0 = TensorParallelColumnLinear(config.d_model, config.d_ff, bias=False,
+                                                   process_group=process_group)
+            self.wi_1 = TensorParallelColumnLinear(config.d_model, config.d_ff, bias=False,
+                                                   process_group=process_group)
+            self.wo = TensorParallelRowLinear(config.d_ff, config.d_model, bias=False,
+                                              process_group=process_group)
+
         self.dropout = nn.Dropout(config.dropout_rate)
-        self.act = ACT2FN[config.dense_act_fn]
+        self.act = ACT2FN[config.dense_act_fn] if "gelu" not in config.dense_act_fn else lambda \
+                x: torch.nn.functional.gelu(x, approximate="tanh")
 
     def forward(self, hidden_states):
         hidden_gelu = self.act(self.wi_0(hidden_states))
@@ -320,12 +338,12 @@ class T5DenseGatedActDense(nn.Module):
 
 
 class T5LayerFF(nn.Module):
-    def __init__(self, config: T5Config):
+    def __init__(self, config: T5Config, process_group=None):
         super().__init__()
         if config.is_gated_act:
-            self.DenseReluDense = T5DenseGatedActDense(config)
+            self.DenseReluDense = T5DenseGatedActDense(config, process_group=process_group)
         else:
-            self.DenseReluDense = T5DenseActDense(config)
+            self.DenseReluDense = T5DenseActDense(config, process_group=process_group)
 
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
@@ -338,7 +356,7 @@ class T5LayerFF(nn.Module):
 
 
 class T5Attention(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias=False):
+    def __init__(self, config: T5Config, has_relative_attention_bias=False, process_group=None):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.has_relative_attention_bias = has_relative_attention_bias
@@ -351,10 +369,20 @@ class T5Attention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
         # Mesh TensorFlow initialization to avoid scaling before softmax
-        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
+        if process_group is None:
+            self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
+            self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
+            self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
+            self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
+        else:
+            assert self.n_heads % process_group.size() == 0
+            self.q = TensorParallelColumnLinear(self.d_model, self.inner_dim, bias=False, process_group=process_group)
+            self.k = TensorParallelColumnLinear(self.d_model, self.inner_dim, bias=False, process_group=process_group)
+            self.v = TensorParallelColumnLinear(self.d_model, self.inner_dim, bias=False, process_group=process_group)
+            self.o = TensorParallelRowLinear(self.inner_dim, self.d_model, bias=False, process_group=process_group)
+            self.n_heads = self.n_heads // process_group.size()
+            self.inner_dim = self.inner_dim // process_group.size()
+
 
         if self.has_relative_attention_bias:
             self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
@@ -466,8 +494,8 @@ class T5Attention(nn.Module):
 
         if past_key_value is not None:
             assert (
-                len(past_key_value) == 2
-            ), f"past_key_value should have 2 past states: keys and values. Got { len(past_key_value)} past states"
+                    len(past_key_value) == 2
+            ), f"past_key_value should have 2 past states: keys and values. Got {len(past_key_value)} past states"
             real_seq_length += past_key_value[0].shape[2] if query_length is None else query_length
 
         key_length = real_seq_length if key_value_states is None else key_value_states.shape[1]
@@ -536,7 +564,7 @@ class T5Attention(nn.Module):
             # if key and values are already calculated
             # we want only the last query position bias
             if past_key_value is not None:
-                position_bias = position_bias[:, :, -hidden_states.size(1) :, :]
+                position_bias = position_bias[:, :, -hidden_states.size(1):, :]
 
             if mask is not None:
                 position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
@@ -572,9 +600,9 @@ class T5Attention(nn.Module):
 
 
 class T5LayerSelfAttention(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config, has_relative_attention_bias=False, process_group=None):
         super().__init__()
-        self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias)
+        self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias, process_group=process_group)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -604,9 +632,9 @@ class T5LayerSelfAttention(nn.Module):
 
 
 class T5LayerCrossAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, process_group=None):
         super().__init__()
-        self.EncDecAttention = T5Attention(config, has_relative_attention_bias=False)
+        self.EncDecAttention = T5Attention(config, has_relative_attention_bias=False, process_group=process_group)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -640,15 +668,15 @@ class T5LayerCrossAttention(nn.Module):
 
 
 class T5Block(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config, has_relative_attention_bias=False, process_group=None):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.layer = nn.ModuleList()
-        self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
+        self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias, process_group=process_group))
         if self.is_decoder:
-            self.layer.append(T5LayerCrossAttention(config))
+            self.layer.append(T5LayerCrossAttention(config, process_group=process_group))
 
-        self.layer.append(T5LayerFF(config))
+        self.layer.append(T5LayerFF(config, process_group=process_group))
 
     def forward(
         self,
@@ -851,14 +879,14 @@ class T5PreTrainedModel(PreTrainedModel):
 
 
 class T5Stack(T5PreTrainedModel):
-    def __init__(self, config, embed_tokens=None):
+    def __init__(self, config, embed_tokens=None, process_group=None):
         super().__init__(config)
 
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
 
         self.block = nn.ModuleList(
-            [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
+            [T5Block(config, has_relative_attention_bias=bool(i == 0), process_group=process_group) for i in range(config.num_layers)]
         )
         self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
@@ -1512,21 +1540,33 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         super().__init__(config)
         self.model_dim = config.d_model
 
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        if config.tp_parallel:
+            process_group = torch.distributed.distributed_c10d._get_default_group()
+        else:
+            process_group = None
+
+        if process_group is None:
+            self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        else:
+            self.shared = TensorParallelEmbedding(config.vocab_size, config.d_model, process_group)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
-        self.encoder = T5Stack(encoder_config, self.shared)
+        self.encoder = T5Stack(encoder_config, self.shared, process_group=process_group)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
-        self.decoder = T5Stack(decoder_config, self.shared)
+        self.decoder = T5Stack(decoder_config, self.shared, process_group=process_group)
 
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        if process_group is None:
+            self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        else:
+            self.lm_head = nn.Linear(config.d_model, config.vocab_size // process_group.size(), bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()

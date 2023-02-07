@@ -98,7 +98,8 @@ class T5Config(PretrainedConfig):
         use_cache=True,
         pad_token_id=0,
         eos_token_id=1,
-        **kwargs,
+        tp_parallel=False,
+        **kwargs
     ):
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -116,6 +117,7 @@ class T5Config(PretrainedConfig):
         self.initializer_factor = initializer_factor
         self.feed_forward_proj = feed_forward_proj
         self.use_cache = use_cache
+        self.tp_parallel = tp_parallel
 
         act_info = self.feed_forward_proj.split("-")
         self.dense_act_fn = act_info[-1]
