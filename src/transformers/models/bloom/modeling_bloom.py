@@ -15,6 +15,7 @@
 """PyTorch BLOOM model."""
 
 import math
+import os
 import warnings
 from typing import Optional, Tuple, Union
 
@@ -40,11 +41,16 @@ from .parallel_layers import TensorParallelColumnLinear, TensorParallelEmbedding
 
 logger = logging.get_logger(__name__)
 
-CUSTOM_KERNELS_ENABLED=False
-try:
-    from .custom_kernels import fused_bloom_attention_cuda
-    CUSTOM_KERNELS_ENABLED=True
-except ImportError:
+CUSTOM_KERNELS_ENABLED = False
+if not os.getenv("DISABLE_CUSTOM_KERNELS", False):
+    try:
+        from .custom_kernels import fused_bloom_attention_cuda
+
+        CUSTOM_KERNELS_ENABLED = True
+    except ImportError:
+        pass
+
+if not CUSTOM_KERNELS_ENABLED:
     logger.warning("We're not using custom kernels.")
 
 _CHECKPOINT_FOR_DOC = "bigscience/bloom-560m"
@@ -62,7 +68,7 @@ BLOOM_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 
 def _make_causal_mask(
-    input_ids_shape: torch.Size, device: torch.device, past_key_values_length: int
+        input_ids_shape: torch.Size, device: torch.device, past_key_values_length: int
 ) -> torch.BoolTensor:
     """
     Make causal mask used for self-attention.
@@ -129,6 +135,7 @@ def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int) -> torch.Te
     alibi = slopes[..., None] * arange_tensor
     return alibi
 
+
 # @torch.jit.script
 def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: bool) -> torch.Tensor:
     """
@@ -150,7 +157,8 @@ def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: 
 
 
 # @torch.jit.script # this is shit for unknow reasons.
-def _split_heads(fused_qkv: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _split_heads(fused_qkv: torch.Tensor, num_heads: int, head_dim: int) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
     storage as `fused_qkv`
@@ -171,6 +179,7 @@ def _split_heads(fused_qkv: torch.Tensor, num_heads: int, head_dim: int) -> Tupl
     value_layer = value_layer.transpose(1, 2).reshape(batch_size * num_heads, seq_length, head_dim)
 
     return query_layer, key_layer, value_layer
+
 
 # @torch.jit.script
 def _merge_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
@@ -197,6 +206,7 @@ def _merge_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor
 
     # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
     return x.reshape(batch_size, seq_length, num_heads * head_dim)
+
 
 class BloomAttention(nn.Module):
     def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup]):
@@ -227,21 +237,22 @@ class BloomAttention(nn.Module):
         else:
             assert self.num_heads % process_group.size() == 0
             self.num_heads = self.num_heads // process_group.size()
-            self.query_key_value = TensorParallelColumnLinear(self.hidden_size, 3 * self.hidden_size, process_group=process_group, bias=True)
+            self.query_key_value = TensorParallelColumnLinear(self.hidden_size, 3 * self.hidden_size,
+                                                              process_group=process_group, bias=True)
             self.dense = TensorParallelRowLinear(self.hidden_size, self.hidden_size, process_group=process_group)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
 
     @staticmethod
     def compute_attention(
-        fused_qkv: torch.Tensor,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        alibi: torch.Tensor,
-        attention_mask: torch.Tensor,
-        head_mask: Optional[torch.Tensor],
-        beta: float,
-        inv_norm_factor: float,
-        num_heads: int,
-        use_cache: bool
+            fused_qkv: torch.Tensor,
+            layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]],
+            alibi: torch.Tensor,
+            attention_mask: torch.Tensor,
+            head_mask: Optional[torch.Tensor],
+            beta: float,
+            inv_norm_factor: float,
+            num_heads: int,
+            use_cache: bool
     ):
         batch_size, q_length, three_times_hidden_size = fused_qkv.shape
         head_dim = three_times_hidden_size // (3 * num_heads)
@@ -303,15 +314,15 @@ class BloomAttention(nn.Module):
         return context_layer, present, attention_probs
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        alibi: torch.Tensor,
-        attention_mask: torch.Tensor,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = False,
-        output_attentions: bool = False,
+            self,
+            hidden_states: torch.Tensor,
+            residual: torch.Tensor,
+            alibi: torch.Tensor,
+            attention_mask: torch.Tensor,
+            layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            use_cache: bool = False,
+            output_attentions: bool = False,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
         batch_size, q_length, _ = fused_qkv.shape
@@ -319,7 +330,6 @@ class BloomAttention(nn.Module):
         if layer_past is not None:
             past_key, past_value = layer_past
             layer_past = (past_key.view(-1, *past_key.shape[-2:]), past_value.view(-1, *past_value.shape[-2:]))
-
 
         if CUSTOM_KERNELS_ENABLED:
             assert self.training is False, "Only foward pass was implemented"
@@ -354,8 +364,8 @@ class BloomAttention(nn.Module):
             output_tensor = torch.zeros_like(context_layer)
             for i in range(self.pretraining_tp):
                 output_tensor = output_tensor + F.linear(
-                    context_layer[:, :, int(i * slices) : int((i + 1) * slices)],
-                    self.dense.weight[:, int(i * slices) : int((i + 1) * slices)],
+                    context_layer[:, :, int(i * slices): int((i + 1) * slices)],
+                    self.dense.weight[:, int(i * slices): int((i + 1) * slices)],
                 )
         else:
             output_tensor = self.dense(context_layer)
@@ -394,8 +404,8 @@ class BloomMLP(nn.Module):
             slices = self.dense_4h_to_h.weight.shape[-1] / self.pretraining_tp
             for i in range(self.pretraining_tp):
                 intermediate_output = intermediate_output + F.linear(
-                    hidden_states[:, :, int(i * slices) : int((i + 1) * slices)],
-                    self.dense_4h_to_h.weight[:, int(i * slices) : int((i + 1) * slices)],
+                    hidden_states[:, :, int(i * slices): int((i + 1) * slices)],
+                    self.dense_4h_to_h.weight[:, int(i * slices): int((i + 1) * slices)],
                 )
         else:
             intermediate_output = self.dense_4h_to_h(hidden_states)
@@ -422,14 +432,14 @@ class BloomBlock(nn.Module):
         self.hidden_dropout = config.hidden_dropout
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        alibi: torch.Tensor,
-        attention_mask: torch.Tensor,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = False,
-        output_attentions: bool = False,
+            self,
+            hidden_states: torch.Tensor,
+            alibi: torch.Tensor,
+            attention_mask: torch.Tensor,
+            layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            use_cache: bool = False,
+            output_attentions: bool = False,
     ):
         # hidden_states: [batch_size, seq_length, hidden_size]
 
@@ -514,7 +524,7 @@ class BloomPreTrainedModel(PreTrainedModel):
 
     @staticmethod
     def _convert_to_standard_cache(
-        past_key_value: Tuple[Tuple[torch.Tensor, torch.Tensor]], batch_size: int
+            past_key_value: Tuple[Tuple[torch.Tensor, torch.Tensor]], batch_size: int
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Standardizes the format of the cache so as to match most implementations, i.e. to tuple(tuple([batch_size,
@@ -534,7 +544,7 @@ class BloomPreTrainedModel(PreTrainedModel):
 
     @staticmethod
     def _convert_to_bloom_cache(
-        past_key_value: Tuple[Tuple[torch.Tensor, torch.Tensor]]
+            past_key_value: Tuple[Tuple[torch.Tensor, torch.Tensor]]
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Converts the cache to the format expected by Bloom, i.e. to tuple(tuple([batch_size * num_heads, ...]))
@@ -627,7 +637,7 @@ BLOOM_INPUTS_DOCSTRING = r"""
     BLOOM_START_DOCSTRING,
 )
 class BloomModel(BloomPreTrainedModel):
-    def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup]=None):
+    def __init__(self, config: BloomConfig, process_group: Optional[torch.distributed.ProcessGroup] = None):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -637,13 +647,15 @@ class BloomModel(BloomPreTrainedModel):
         if process_group is None:
             self.word_embeddings = nn.Embedding(config.vocab_size, self.embed_dim)
         else:
-            self.word_embeddings = TensorParallelEmbedding(config.vocab_size, self.embed_dim, process_group=process_group)
+            self.word_embeddings = TensorParallelEmbedding(config.vocab_size, self.embed_dim,
+                                                           process_group=process_group)
             self.tp_rank = process_group.rank()
             self.tp_world_size = process_group.size()
         self.word_embeddings_layernorm = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         # Transformer blocks
-        self.h = nn.ModuleList([BloomBlock(config, process_group=process_group) for _ in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList(
+            [BloomBlock(config, process_group=process_group) for _ in range(config.num_hidden_layers)])
 
         # Final Layer Norm
         self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
@@ -657,7 +669,7 @@ class BloomModel(BloomPreTrainedModel):
         return self.word_embeddings
 
     def _prepare_attn_mask(
-        self, attention_mask: torch.Tensor, input_shape: Tuple[int, int], past_key_values_length: int
+            self, attention_mask: torch.Tensor, input_shape: Tuple[int, int], past_key_values_length: int
     ) -> torch.BoolTensor:
         # create causal mask
         # [batch_size, seq_length] -> [batch_size, tgt_length, src_length]
@@ -688,17 +700,17 @@ class BloomModel(BloomPreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **deprecated_arguments,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            head_mask: Optional[torch.LongTensor] = None,
+            inputs_embeds: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            **deprecated_arguments,
     ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
         if deprecated_arguments.pop("position_ids", False) is not False:
             # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
@@ -873,12 +885,12 @@ class BloomForCausalLM(BloomPreTrainedModel):
         self.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(
-        self,
-        input_ids: torch.LongTensor,
-        past_key_values: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        **kwargs,
+            self,
+            input_ids: torch.LongTensor,
+            past_key_values: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            **kwargs,
     ) -> dict:
         # only last token for input_ids if past is not None
         if past_key_values:
@@ -910,18 +922,18 @@ class BloomForCausalLM(BloomPreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **deprecated_arguments,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            **deprecated_arguments,
     ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithCrossAttentions]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -981,7 +993,7 @@ class BloomForCausalLM(BloomPreTrainedModel):
         )
 
     def _reorder_cache(
-        self, past: Tuple[Tuple[torch.Tensor, torch.Tensor], ...], beam_idx: torch.LongTensor
+            self, past: Tuple[Tuple[torch.Tensor, torch.Tensor], ...], beam_idx: torch.LongTensor
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
         """
         This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
@@ -1040,18 +1052,18 @@ class BloomForSequenceClassification(BloomPreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **deprecated_arguments,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            **deprecated_arguments,
     ) -> Union[Tuple[torch.Tensor], SequenceClassifierOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1176,18 +1188,18 @@ class BloomForTokenClassification(BloomPreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **deprecated_arguments,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            **deprecated_arguments,
     ) -> Union[Tuple[torch.Tensor], TokenClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1263,17 +1275,17 @@ class BloomForQuestionAnswering(BloomPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(BLOOM_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        start_positions: Optional[torch.LongTensor] = None,
-        end_positions: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            head_mask: Optional[torch.FloatTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            start_positions: Optional[torch.LongTensor] = None,
+            end_positions: Optional[torch.LongTensor] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ) -> Union[Tuple, QuestionAnsweringModelOutput]:
         r"""
         start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):

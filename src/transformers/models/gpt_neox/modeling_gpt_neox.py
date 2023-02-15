@@ -16,6 +16,7 @@
 
 from typing import Optional, Tuple, Union
 
+import os
 import torch
 import torch.distributed
 import torch.utils.checkpoint
@@ -37,11 +38,16 @@ from .parallel_layers import TensorParallelColumnLinear, TensorParallelEmbedding
 
 logger = logging.get_logger(__name__)
 
-CUSTOM_KERNELS_ENABLED=False
-try:
-    from .custom_kernels import fused_attention_cuda
-    CUSTOM_KERNELS_ENABLED=True
-except ImportError:
+CUSTOM_KERNELS_ENABLED = False
+if not os.getenv("DISABLE_CUSTOM_KERNELS", False):
+    try:
+        from .custom_kernels import fused_attention_cuda
+
+        CUSTOM_KERNELS_ENABLED = True
+    except ImportError:
+        pass
+
+if not CUSTOM_KERNELS_ENABLED:
     logger.warning("We're not using custom kernels.")
 
 _CHECKPOINT_FOR_DOC = "trl-internal-testing/tiny-random-GPTNeoXForCausalLM"
