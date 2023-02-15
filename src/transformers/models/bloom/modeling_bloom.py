@@ -42,7 +42,7 @@ from .parallel_layers import TensorParallelColumnLinear, TensorParallelEmbedding
 logger = logging.get_logger(__name__)
 
 CUSTOM_KERNELS_ENABLED = False
-if not os.getenv("DISABLE_CUSTOM_KERNELS", False):
+if not os.environ.get("DISABLE_CUSTOM_KERNELS", "False") == "True":
     try:
         from .custom_kernels import fused_bloom_attention_cuda
 
