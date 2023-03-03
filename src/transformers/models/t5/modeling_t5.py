@@ -234,6 +234,21 @@ DEPARALLELIZE_DOCSTRING = r"""
     ```
 """
 
+@torch.jit.script
+def layer_norm(hidden_states, weight, epsilon):
+    # T5 uses a layer_norm which only scales and doesn't shift, which is also known as Root Mean
+    # Square Layer Normalization https://arxiv.org/abs/1910.07467 thus varience is calculated
+    # w/o mean and there is no bias. Additionally we want to make sure that the accumulation for
+    # half-precision inputs is done in fp32
+
+    variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + epsilon)
+
+    # convert into half-precision if necessary
+    if weight.dtype in [torch.float16, torch.bfloat16]:
+        hidden_states = hidden_states.to(weight.dtype)
+
+    return weight * hidden_states
 
 class T5LayerNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -242,10 +257,10 @@ class T5LayerNorm(nn.Module):
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+        self.variance_epsilon = torch.tensor(eps)
 
     def forward(self, hidden_states):
-        return torch.nn.functional.layer_norm(hidden_states, self.weight.shape, self.weight, None, self.variance_epsilon)
+        return layer_norm(hidden_states, self.weight, self.variance_epsilon)
 
 
 try:
