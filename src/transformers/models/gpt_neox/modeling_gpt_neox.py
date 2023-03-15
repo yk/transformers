@@ -16,6 +16,7 @@
 
 from typing import Optional, Tuple, Union
 
+import os
 import torch
 import torch.distributed
 import torch.utils.checkpoint
@@ -37,6 +38,18 @@ from .parallel_layers import TensorParallelColumnLinear, TensorParallelEmbedding
 
 logger = logging.get_logger(__name__)
 
+CUSTOM_KERNELS_ENABLED = False
+if not os.environ.get("DISABLE_CUSTOM_KERNELS", "False") == "True":
+    try:
+        from .custom_kernels import fused_attention_cuda
+
+        CUSTOM_KERNELS_ENABLED = True
+    except ImportError:
+        pass
+
+if not CUSTOM_KERNELS_ENABLED:
+    logger.warning("We're not using custom kernels.")
+
 _CHECKPOINT_FOR_DOC = "trl-internal-testing/tiny-random-GPTNeoXForCausalLM"
 _REAL_CHECKPOINT_FOR_DOC = "EleutherAI/gpt-neox-20b"
 _CONFIG_FOR_DOC = "GPTNeoXConfig"
@@ -45,6 +58,54 @@ GPT_NEOX_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "EleutherAI/gpt-neox-20b",
     # See all GPTNeoX models at https://huggingface.co/models?filter=gpt_neox
 ]
+
+
+def make_causal_mask(
+    input_ids_shape: torch.Size, device: torch.device, past_key_values_length: int
+) -> torch.BoolTensor:
+    """
+    Make causal mask used for self-attention.
+    """
+    batch_size, target_length = input_ids_shape
+    mask = torch.ones((target_length, target_length + past_key_values_length), dtype=torch.bool, device=device)
+    mask = mask.triu(1 + past_key_values_length)
+
+    expanded_mask = mask.unsqueeze(0).expand(batch_size, target_length, target_length + past_key_values_length)
+    return expanded_mask
+
+
+def expand_mask(mask: torch.Tensor, tgt_length: int) -> torch.BoolTensor:
+    """
+    Expands attention_mask from `[batch_size, src_length]` to `[batch_size, 1, tgt_length, src_length]`.
+    """
+    batch_size, src_length = mask.shape
+    tgt_length = tgt_length if tgt_length is not None else src_length
+
+    expanded_mask = ~(mask[:, None, :].to(torch.bool))
+    return expanded_mask.expand(batch_size, tgt_length, src_length)
+
+
+def prepare_attn_mask(
+    attention_mask: torch.Tensor, input_shape: Tuple[int, int], past_key_values_length: int
+) -> torch.BoolTensor:
+    # create causal mask
+    # [batch_size, seq_length] -> [batch_size, tgt_length, src_length]
+    combined_attention_mask = None
+    device = attention_mask.device
+    _, src_length = input_shape
+
+    if src_length > 1:
+        combined_attention_mask = make_causal_mask(
+            input_shape, device=device, past_key_values_length=past_key_values_length
+        )
+
+    # [batch_size, seq_length] -> [batch_size, tgt_length, src_length]
+    expanded_attn_mask = expand_mask(attention_mask, tgt_length=src_length)
+    combined_attention_mask = (
+        expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask | combined_attention_mask
+    )
+
+    return combined_attention_mask
 
 
 class GPTNeoXPreTrainedModel(PreTrainedModel):
@@ -87,7 +148,7 @@ class GPTNeoXAttention(nn.Module):
         max_positions = config.max_position_embeddings
         self.register_buffer(
             "bias",
-            torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)).view(
+            torch.tril(torch.ones((max_positions, max_positions), dtype=torch.uint8)).view(
                 1, 1, max_positions, max_positions
             ),
         )
@@ -95,7 +156,9 @@ class GPTNeoXAttention(nn.Module):
         self.rotary_emb = RotaryEmbedding(
             self.rotary_ndims, config.max_position_embeddings, base=config.rotary_emb_base
         )
-        self.norm_factor = torch.sqrt(torch.tensor(self.head_size, dtype=torch.float32)).to(torch.get_default_dtype())
+        self.inv_norm_factor = 1.0 / torch.sqrt(torch.tensor(self.head_size, dtype=torch.float32)).to(
+            torch.get_default_dtype()
+        )
 
         if process_group is None:
             self.query_key_value = nn.Linear(config.hidden_size, 3 * config.hidden_size)
@@ -103,13 +166,15 @@ class GPTNeoXAttention(nn.Module):
         else:
             assert self.num_attention_heads % process_group.size() == 0
             self.num_attention_heads = self.num_attention_heads // process_group.size()
-            self.query_key_value = TensorParallelColumnLinear(self.hidden_size, 3 * self.hidden_size,
-                                                              process_group=process_group, bias=True)
+            self.query_key_value = TensorParallelColumnLinear(
+                self.hidden_size, 3 * self.hidden_size, process_group=process_group, bias=True
+            )
             self.dense = TensorParallelRowLinear(self.hidden_size, self.hidden_size, process_group=process_group)
 
     def forward(
         self,
         hidden_states,
+        position_ids,
         attention_mask,
         head_mask=None,
         layer_past=None,
@@ -141,28 +206,46 @@ class GPTNeoXAttention(nn.Module):
 
         # Compute token offset for rotary embeddings (when decoding)
         seq_len = key.shape[-2]
-        offset = 0
         if has_layer_past:
-            offset = layer_past[0].shape[-2]
-            seq_len += offset
-        cos, sin = self.rotary_emb(value, seq_len=seq_len)
-        query, key = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, offset=offset)
-        query = torch.cat((query, query_pass), dim=-1)
-        key = torch.cat((key, key_pass), dim=-1)
+            seq_len += layer_past[0].shape[-2]
 
-        # Cache QKV values
-        if has_layer_past:
-            past_key = layer_past[0]
-            past_value = layer_past[1]
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
-        present = (key, value) if use_cache else None
+        query, key = self.rotary_emb(query_rot, key_rot, position_ids, seq_len)
 
-        # Compute attention
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+        # cos, sin = self.rotary_emb(value, seq_len=seq_len)
+        # query, key = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, offset=offset)
 
-        # Reshape outputs
-        attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_size)
+        if CUSTOM_KERNELS_ENABLED:
+            attn_output, present, attn_weights = fused_attention_cuda.forward(
+                query,
+                query_pass,
+                key,
+                key_pass,
+                value,
+                layer_past,
+                attention_mask,
+                head_mask,
+                self.inv_norm_factor,
+                self.num_attention_heads,
+                use_cache,
+            )
+        else:
+            query = torch.cat((query, query_pass), dim=-1)
+            key = torch.cat((key, key_pass), dim=-1)
+
+            # Cache QKV values
+            if has_layer_past:
+                past_key = layer_past[0]
+                past_value = layer_past[1]
+                key = torch.cat((past_key, key), dim=-2)
+                value = torch.cat((past_value, value), dim=-2)
+            present = (key, value) if use_cache else None
+
+            # Compute attention
+            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+
+            # Reshape outputs
+            attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_size)
+
         attn_output = self.dense(attn_output)
 
         outputs = (attn_output, present)
@@ -202,35 +285,27 @@ class GPTNeoXAttention(nn.Module):
         batch_size, num_attention_heads, query_length, attn_head_size = query.size()
         key_length = key.size(-2)
 
-        causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
-
         query = query.view(batch_size * num_attention_heads, query_length, attn_head_size)
         key = key.view(batch_size * num_attention_heads, key_length, attn_head_size)
         attn_scores = torch.zeros(
-            batch_size * num_attention_heads,
-            query_length,
-            key_length,
+            1,
             dtype=query.dtype,
             device=key.device,
-        )
+        ).expand(batch_size * num_attention_heads, query_length, key_length)
         attn_scores = torch.baddbmm(
             attn_scores,
             query,
             key.transpose(1, 2),
             beta=1.0,
-            alpha=(torch.tensor(1.0, dtype=self.norm_factor.dtype, device=self.norm_factor.device) / self.norm_factor),
+            alpha=self.inv_norm_factor,
         )
+
+        # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
+        input_dtype = attn_scores.dtype
+        if input_dtype in [torch.float16, torch.bfloat16]:
+            attn_scores = attn_scores.to(torch.float)
+        attn_scores = torch.where(attention_mask, torch.finfo(attn_scores.dtype).min, attn_scores)
         attn_scores = attn_scores.view(batch_size, num_attention_heads, query_length, key_length)
-
-        mask_value = torch.finfo(attn_scores.dtype).min
-        # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-        # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-        mask_value = torch.tensor(mask_value, dtype=attn_scores.dtype).to(attn_scores.device)
-        attn_scores = torch.where(causal_mask, attn_scores, mask_value)
-
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_scores = attn_scores + attention_mask
 
         attn_weights = nn.functional.softmax(attn_scores, dim=-1)
         attn_weights = attn_weights.to(value.dtype)
@@ -243,38 +318,47 @@ class GPTNeoXAttention(nn.Module):
         return attn_output, attn_weights
 
 
-def attention_mask_func(attention_scores, ltor_mask):
-    attention_scores.masked_fill_(~ltor_mask, torch.finfo(attention_scores.dtype).min)
-    return attention_scores
-
-
 class RotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings, base=10000, device=None):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
-        self.register_buffer("inv_freq", inv_freq)
+        self.true_inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+        self.register_buffer("inv_freq", self.true_inv_freq)
 
         # Build here to make `torch.jit.trace` work.
         self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        self.cos_cached = None
+        self.sin_cached = None
+
+    @staticmethod
+    def rotate_half(x):
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    @staticmethod
+    def _create_cos_sin(inv_freq, max_position_embeddings, dtype, device):
+        t = torch.arange(max_position_embeddings, device=inv_freq.device, dtype=inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cached = emb.cos()[None, None, :, :]
-        self.sin_cached = emb.sin()[None, None, :, :]
+        return emb.cos().to(device).to(dtype), emb.sin().to(device).to(dtype)
 
-    def forward(self, x, seq_len=None):
+    def forward(self, q, k, position_ids, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        # This `if` block is unlikely to be run after we build sin/cos in `__init__`. Keep the logic here just in case.
-        if seq_len > self.max_seq_len_cached:
-            self.max_seq_len_cached = seq_len
-            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            # Different from paper, but it uses a different permutation in order to obtain the same calculation
-            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.cos_cached = emb.cos()[None, None, :, :]
-            self.sin_cached = emb.sin()[None, None, :, :]
-        return self.cos_cached[:seq_len, ...].to(x.device), self.sin_cached[:seq_len, ...].to(x.device)
+        if seq_len > self.max_seq_len_cached or self.cos_cached is None or self.sin_cached is None:
+            if seq_len > self.max_seq_len_cached:
+                self.max_seq_len_cached = seq_len
+            self.cos_cached, self.sin_cached = self._create_cos_sin(
+                self.true_inv_freq, self.max_seq_len_cached, q.dtype, q.device
+            )
+        cos = self.cos_cached[position_ids].unsqueeze(1)
+        sin = self.sin_cached[position_ids].unsqueeze(1)
+
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        return q_embed, k_embed
+
 
 
 def rotate_half(x):
@@ -295,18 +379,22 @@ def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
 class GPTNeoXMLP(nn.Module):
     def __init__(self, config, process_group: Optional[torch.distributed.ProcessGroup]):
         super().__init__()
-        self.act = ACT2FN[config.hidden_act] if "gelu" not in config.hidden_act else lambda \
-                x: torch.nn.functional.gelu(x, approximate="tanh")
-        # self.act = ACT2FN[config.hidden_act]
+        self.act = (
+            ACT2FN[config.hidden_act]
+            if "gelu_fast" not in config.hidden_act
+            else lambda x: torch.nn.functional.gelu(x, approximate="tanh")
+        )
 
         if process_group is None:
             self.dense_h_to_4h = nn.Linear(config.hidden_size, config.intermediate_size)
             self.dense_4h_to_h = nn.Linear(config.intermediate_size, config.hidden_size)
         else:
-            self.dense_h_to_4h = TensorParallelColumnLinear(config.hidden_size, config.intermediate_size,
-                                                            process_group=process_group)
-            self.dense_4h_to_h = TensorParallelRowLinear(config.intermediate_size, config.hidden_size,
-                                                         process_group=process_group)
+            self.dense_h_to_4h = TensorParallelColumnLinear(
+                config.hidden_size, config.intermediate_size, process_group=process_group
+            )
+            self.dense_4h_to_h = TensorParallelRowLinear(
+                config.intermediate_size, config.hidden_size, process_group=process_group
+            )
 
     def forward(self, hidden_states):
         hidden_states = self.dense_h_to_4h(hidden_states)
@@ -327,6 +415,7 @@ class GPTNeoXLayer(nn.Module):
     def forward(
         self,
         hidden_states,
+        position_ids,
         attention_mask=None,
         head_mask=None,
         use_cache=False,
@@ -336,6 +425,7 @@ class GPTNeoXLayer(nn.Module):
         attention_layer_outputs = self.attention(
             self.input_layernorm(hidden_states),
             attention_mask=attention_mask,
+            position_ids=position_ids,
             layer_past=layer_past,
             head_mask=head_mask,
             use_cache=use_cache,
@@ -392,6 +482,11 @@ GPT_NEOX_INPUTS_DOCSTRING = r"""
             - 0 for tokens that are **masked**.
 
             [What are attention masks?](../glossary#attention-mask)
+        position_ids (`torch.LongTensor` of shape `({0})`, *optional*):
+            Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
+            config.max_position_embeddings - 1]`.
+
+            [What are position IDs?](../glossary#position-ids)
         head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
             Mask to nullify selected heads of the self-attention modules. Mask values selected in `[0, 1]`:
 
@@ -432,8 +527,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
                 self.tp_embeddings = True
 
         if self.tp_embeddings:
-            self.embed_in = TensorParallelEmbedding(config.vocab_size, config.hidden_size,
-                                                    process_group=process_group)
+            self.embed_in = TensorParallelEmbedding(config.vocab_size, config.hidden_size, process_group=process_group)
         else:
             self.embed_in = nn.Embedding(config.vocab_size, config.hidden_size)
 
@@ -461,6 +555,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        position_ids=None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -501,24 +596,34 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         if past_key_values is None:
             past_key_values = tuple([None] * self.config.num_hidden_layers)
 
-        # Attention mask.
-        if attention_mask is not None:
-            assert batch_size > 0, "batch_size has to be defined and > 0"
-            attention_mask = attention_mask.view(batch_size, -1)
-            # We create a 3D attention mask from a 2D tensor mask.
-            # Sizes are [batch_size, 1, 1, to_seq_length]
-            # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
-            # this attention mask is more simple than the triangular masking of causal attention
-            # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
-            attention_mask = attention_mask[:, None, None, :]
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_in(input_ids)
 
-            # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
-            # masked positions, this operation will create a tensor which is 0.0 for
-            # positions we want to attend and the dtype's smallest value for masked positions.
-            # Since we are adding it to the raw scores before the softmax, this is
-            # effectively the same as removing these entirely.
-            attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
-            attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
+        hidden_states = inputs_embeds
+
+        # Attention mask.
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+        if past_key_values[0] is not None:
+            past_key_values_length = past_key_values[0][0].shape[-1]
+            seq_length_with_past = seq_length_with_past + past_key_values_length
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
+        else:
+            attention_mask = attention_mask.to(hidden_states.device)
+
+        causal_mask = prepare_attn_mask(
+            attention_mask,
+            input_shape=(batch_size, seq_length),
+            past_key_values_length=past_key_values_length,
+        )
+
+        if hasattr(self, "tp_rank"):
+            assert self.num_attention_heads % self.tp_world_size == 0
+            block_size = self.num_attention_heads // self.tp_world_size
+            causal_mask = torch.repeat_interleave(causal_mask, block_size, dim=0)
+        else:
+            causal_mask = torch.repeat_interleave(causal_mask, self.num_attention_heads, dim=0)
 
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
@@ -526,18 +631,6 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_in(input_ids)
-
-        hidden_states = inputs_embeds
-
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
 
         presents = () if use_cache else None
         all_attentions = () if output_attentions else None
@@ -547,6 +640,11 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
+                if use_cache:
+                    logger.warning(
+                        "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                    )
+                    use_cache = False
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
@@ -558,13 +656,14 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
                 outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer),
                     hidden_states,
-                    attention_mask,
+                    causal_mask,
                     head_mask[i],
                 )
             else:
                 outputs = layer(
                     hidden_states,
-                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    attention_mask=causal_mask,
                     head_mask=head_mask[i],
                     layer_past=layer_past,
                     use_cache=use_cache,
@@ -627,6 +726,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        position_ids=None,
         attention_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
@@ -680,6 +780,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
 
         outputs = self.gpt_neox(
             input_ids,
+            position_ids=position_ids,
             attention_mask=attention_mask,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
