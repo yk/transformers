@@ -191,35 +191,28 @@ class GPTNeoXAttention(nn.Module):
         # [batch, seq_len, (num_heads * 3 * head_size)]
         #   --> [batch, seq_len, num_heads, 3 * head_size]
         new_qkv_shape = qkv.size()[:-1] + (self.num_attention_heads, 3 * self.head_size)
-        qkv = qkv.view(*new_qkv_shape)
-
+        qkv = qkv.view(*new_qkv_shape).permute(0, 2, 1, 3)
         # [batch, seq_len, num_attention_heads, 3 * head_size] --> 3 [batch, num_attention_heads, seq_len, head_size]
-        query = qkv[..., : self.head_size].permute(0, 2, 1, 3)
-        key = qkv[..., self.head_size : 2 * self.head_size].permute(0, 2, 1, 3)
-        value = qkv[..., 2 * self.head_size :].permute(0, 2, 1, 3)
-
-        # Compute rotary embeddings on rotary_ndims
-        query_rot = query[..., : self.rotary_ndims]
-        query_pass = query[..., self.rotary_ndims :]
-        key_rot = key[..., : self.rotary_ndims]
-        key_pass = key[..., self.rotary_ndims :]
+        query, key, value = qkv.split(self.head_size, -1)
 
         # Compute token offset for rotary embeddings (when decoding)
         seq_len = key.shape[-2]
         if has_layer_past:
             seq_len += layer_past[0].shape[-2]
 
-        query, key = self.rotary_emb(query_rot, key_rot, position_ids, seq_len)
+        # Compute rotary embeddings on rotary_ndims
+        query_rot = query[..., : self.rotary_ndims]
+        key_rot = key[..., : self.rotary_ndims]
 
-        # cos, sin = self.rotary_emb(value, seq_len=seq_len)
-        # query, key = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, offset=offset)
+        query_rot, key_rot = self.rotary_emb(query_rot, key_rot, position_ids, seq_len)
+
+        query[..., : self.rotary_ndims] = query_rot
+        key[..., : self.rotary_ndims] = key_rot
 
         if CUSTOM_KERNELS_ENABLED:
             attn_output, present, attn_weights = fused_attention_cuda.forward(
                 query,
-                query_pass,
                 key,
-                key_pass,
                 value,
                 layer_past,
                 attention_mask,
@@ -229,9 +222,6 @@ class GPTNeoXAttention(nn.Module):
                 use_cache,
             )
         else:
-            query = torch.cat((query, query_pass), dim=-1)
-            key = torch.cat((key, key_pass), dim=-1)
-
             # Cache QKV values
             if has_layer_past:
                 past_key = layer_past[0]
@@ -352,27 +342,22 @@ class RotaryEmbedding(torch.nn.Module):
             self.cos_cached, self.sin_cached = self._create_cos_sin(
                 self.true_inv_freq, self.max_seq_len_cached, q.dtype, q.device
             )
-        cos = self.cos_cached[position_ids].unsqueeze(1)
-        sin = self.sin_cached[position_ids].unsqueeze(1)
-
-        q_embed = (q * cos) + (rotate_half(q) * sin)
-        k_embed = (k * cos) + (rotate_half(k) * sin)
-        return q_embed, k_embed
+        return rotary_forward(q, k, self.cos_cached, self.sin_cached, position_ids)
 
 
+@torch.jit.script
+def rotary_forward(q, k, cos, sin, position_ids):
+    cos = cos[position_ids].unsqueeze(1)
+    sin = sin[position_ids].unsqueeze(1)
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    chunk_size = q.shape[-1] // 2
+    q1, q2 = q.split(chunk_size, -1)
+    q_rotated = torch.cat((-q2, q1), dim=-1)
+    k1, k2 = k.split(chunk_size, -1)
+    k_rotated = torch.cat((-k2, k1), dim=-1)
 
-
-def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
-    cos = cos[..., offset : q.shape[-2] + offset, :]
-    sin = sin[..., offset : q.shape[-2] + offset, :]
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q * cos) + (q_rotated * sin)
+    k_embed = (k * cos) + (k_rotated * sin)
     return q_embed, k_embed
 
 

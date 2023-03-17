@@ -112,9 +112,7 @@ __global__ void forward_masked_softmax_kernel(
 
 std::tuple<at::Tensor, std::optional<std::vector<at::Tensor>>, at::Tensor> forward(
     const at::Tensor query,
-    const at::Tensor query_pass,
     const at::Tensor key,
-    const at::Tensor key_pass,
     const at::Tensor value,
     const std::optional<std::vector<at::Tensor>> layer_past,
     const at::Tensor attention_mask,
@@ -123,8 +121,8 @@ std::tuple<at::Tensor, std::optional<std::vector<at::Tensor>>, at::Tensor> forwa
     const int num_heads,
     const bool use_cache
 ) {
-    auto query_layer = at::cat({query, query_pass}, 3);
-    auto key_layer = at::cat({key, key_pass}, 3);
+    auto query_layer = query;
+    auto key_layer = key;
     auto value_layer = value;
 
      if (layer_past) {
